@@ -1,3 +1,3 @@
-from .exporter import WordpressWxrExporter, ExportReport
+from .exporter import WordpressWxrExporter, ExportReport, ExportError
 
-__all__ = ["WordpressWxrExporter", "ExportReport"]
+__all__ = ["WordpressWxrExporter", "ExportReport", "ExportError"]

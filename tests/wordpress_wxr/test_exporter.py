@@ -11,7 +11,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from jm_tools.wordpress_wxr import WordpressWxrExporter
+from jm_tools.wordpress_wxr import WordpressWxrExporter, ExportError
 from jm_tools.wordpress_wxr.exporter import ExportReport
 
 
@@ -386,9 +386,7 @@ class TestFrontMatter(unittest.TestCase):
         self.assertIn("title:", fm)
         self.assertIn("date:", fm)
         self.assertIn("url:", fm)
-        self.assertIn('source: "wordpress"', fm) or self.assertIn(
-            "source: wordpress", fm
-        )
+        self.assertIn("source: wordpress", fm)
         self.assertIn("wp:", fm)
         self.assertIn("id:", fm)
         self.assertIn("post_type:", fm)
@@ -903,10 +901,11 @@ class TestErrorHandling(unittest.TestCase):
             out_dir.mkdir()
 
             exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
-            with self.assertRaises(Exception):
+            with self.assertRaises(ExportError):
                 exporter.run()
 
-    def test_unwritable_out_dir_raises(self):
+    def test_unwritable_out_dir_collects_errors(self):
+        """Write errors are collected in report.errors, not raised."""
         item = _make_item(
             post_id="1",
             post_date_gmt="2024-01-01 00:00:00",
@@ -918,12 +917,15 @@ class TestErrorHandling(unittest.TestCase):
             wxr_path = _write_wxr(tmp, xml)
             out_dir = Path(tmp) / "readonly"
             out_dir.mkdir()
-            os.chmod(out_dir, 0o444)
 
             try:
                 exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
-                with self.assertRaises(Exception):
-                    exporter.run()
+                # Make dir read-only after mkdir so exporter can't write files
+                os.chmod(out_dir, 0o444)
+                report = exporter.run()
+                # Write error should be collected, not raised
+                self.assertGreater(len(report.errors), 0)
+                self.assertEqual(report.exported, 0)
             finally:
                 os.chmod(out_dir, 0o755)  # restore for cleanup
 
@@ -998,47 +1000,52 @@ class TestConstructorDefaults(unittest.TestCase):
         with self.assertRaises(TypeError):
             WordpressWxrExporter()
 
-    def test_default_out_dir(self):
+    def test_out_dir_is_required(self):
+        """Library API requires an explicit out_dir."""
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
-            # Default out_dir should be data/writing/wordpress (relative or Path)
-            self.assertIn("wordpress", str(exporter.out_dir))
+            with self.assertRaises(ValueError):
+                WordpressWxrExporter(wxr_path=wxr_path)
 
     def test_default_post_types(self):
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
+            out_dir = Path(tmp) / "output"
+            exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
             self.assertEqual(exporter.post_types, {"post"})
 
     def test_default_statuses(self):
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
+            out_dir = Path(tmp) / "output"
+            exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
             self.assertEqual(exporter.statuses, {"publish"})
 
     def test_default_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
+            out_dir = Path(tmp) / "output"
+            exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
             self.assertFalse(exporter.overwrite)
 
     def test_default_incremental(self):
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
+            out_dir = Path(tmp) / "output"
+            exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
             self.assertTrue(exporter.incremental)
 
     def test_default_max_posts(self):
         with tempfile.TemporaryDirectory() as tmp:
             wxr_path = Path(tmp) / "dummy.xml"
             wxr_path.write_text("<rss></rss>", encoding="utf-8")
-            exporter = WordpressWxrExporter(wxr_path=wxr_path)
+            out_dir = Path(tmp) / "output"
+            exporter = WordpressWxrExporter(wxr_path=wxr_path, out_dir=out_dir)
             self.assertIsNone(exporter.max_posts)
 
 

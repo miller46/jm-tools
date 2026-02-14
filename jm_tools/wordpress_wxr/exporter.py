@@ -6,9 +6,11 @@ individual Markdown files with YAML front matter.
 """
 
 import hashlib
+import io
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -20,14 +22,20 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# XML namespace URIs used in WXR files
-WP_NS = "http://wordpress.org/export/1.2/"
+# XML namespace URIs used in WXR files — multiple versions supported
+_WP_NS_VERSIONS = [
+    "http://wordpress.org/export/1.2/",
+    "http://wordpress.org/export/1.1/",
+    "http://wordpress.org/export/1.0/",
+]
 CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
 DC_NS = "http://purl.org/dc/elements/1.1/"
-EXCERPT_NS = "http://wordpress.org/export/1.2/excerpt/"
 
-# Default output directory
-DEFAULT_OUT_DIR = Path("data/writing/wordpress")
+# Keep module-level constant for backward compatibility
+WP_NS = _WP_NS_VERSIONS[0]
+
+# Default output directory for CLI usage
+_CLI_DEFAULT_OUT_DIR = Path("data/writing/wordpress")
 
 # Front matter key order
 FRONT_MATTER_KEY_ORDER = [
@@ -39,6 +47,10 @@ FRONT_MATTER_KEY_ORDER = [
     "tags",
     "categories",
 ]
+
+
+class ExportError(Exception):
+    """Raised for errors during WXR export (file I/O, XML parsing, etc.)."""
 
 
 @dataclass
@@ -91,14 +103,14 @@ def _parse_rfc2822_datetime(date_str: str) -> Optional[datetime]:
         return None
 
 
-def _resolve_date(item) -> Optional[datetime]:
+def _resolve_date(item, wp_ns: str) -> Optional[datetime]:
     """Resolve the best available date from a WXR item element.
 
     Fallback order: post_date_gmt -> pubDate -> post_date.
     Invalid/unparseable dates are skipped with a warning.
     """
     # Try post_date_gmt first
-    gmt_str = _get_text(item, f"{{{WP_NS}}}post_date_gmt")
+    gmt_str = _get_text(item, f"{{{wp_ns}}}post_date_gmt")
     if gmt_str:
         dt = _parse_wp_datetime(gmt_str)
         if dt:
@@ -114,7 +126,7 @@ def _resolve_date(item) -> Optional[datetime]:
         logger.warning("Unparseable pubDate: %s, falling back", pub_str)
 
     # Try post_date
-    post_str = _get_text(item, f"{{{WP_NS}}}post_date")
+    post_str = _get_text(item, f"{{{wp_ns}}}post_date")
     if post_str:
         dt = _parse_wp_datetime(post_str)
         if dt:
@@ -124,9 +136,9 @@ def _resolve_date(item) -> Optional[datetime]:
     return None
 
 
-def _resolve_slug(item) -> str:
+def _resolve_slug(item, wp_ns: str) -> str:
     """Resolve slug from wp:post_name or slugified title."""
-    post_name = _get_text(item, f"{{{WP_NS}}}post_name")
+    post_name = _get_text(item, f"{{{wp_ns}}}post_name")
     if post_name:
         return post_name
 
@@ -152,6 +164,17 @@ def _html_to_markdown(html_content: str) -> str:
     return md.strip()
 
 
+class _OrderedDumper(yaml.SafeDumper):
+    """YAML dumper that preserves insertion order of OrderedDict."""
+
+
+def _ordered_dict_representer(dumper, data):
+    return dumper.represent_mapping("tag:yaml.org,2002:map", data.items())
+
+
+_OrderedDumper.add_representer(OrderedDict, _ordered_dict_representer)
+
+
 def _build_front_matter(
     title: str,
     date: Optional[datetime],
@@ -163,28 +186,37 @@ def _build_front_matter(
     tags: list,
     categories: list,
 ) -> str:
-    """Build YAML front matter string with stable key order."""
-    # Build ordered dict-like structure manually to maintain key order
+    """Build YAML front matter string with stable key order.
+
+    Uses a single yaml.dump() call with an OrderedDict to ensure safe
+    serialization of all values (no YAML injection via string interpolation).
+    """
     date_str = date.strftime("%Y-%m-%dT%H:%M:%S") if date else ""
 
-    # Use an OrderedDict-style approach via list of tuples to ensure stable order
-    lines = []
-    lines.append("---")
-    lines.append("# source: wordpress export")
-    lines.append(f"title: {yaml.dump(title, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"date: {yaml.dump(date_str, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"url: {yaml.dump(url, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append('source: "wordpress"')
-    lines.append("wp:")
-    lines.append(f"  id: {yaml.dump(post_id, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"  post_type: {yaml.dump(post_type, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"  status: {yaml.dump(status, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"  slug: {yaml.dump(slug, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"tags: {yaml.dump(tags, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append(f"categories: {yaml.dump(categories, default_flow_style=True, allow_unicode=True).strip()}")
-    lines.append("---")
+    data = OrderedDict([
+        ("title", title),
+        ("date", date_str),
+        ("url", url),
+        ("source", "wordpress"),
+        ("wp", OrderedDict([
+            ("id", post_id),
+            ("post_type", post_type),
+            ("status", status),
+            ("slug", slug),
+        ])),
+        ("tags", tags),
+        ("categories", categories),
+    ])
 
-    return "\n".join(lines) + "\n"
+    yaml_body = yaml.dump(
+        data,
+        Dumper=_OrderedDumper,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+    )
+
+    return "---\n# source: wordpress export\n" + yaml_body + "---\n"
 
 
 def _extract_tags(item) -> list:
@@ -209,6 +241,47 @@ def _extract_categories(item) -> list:
     return categories
 
 
+def _detect_wp_namespace(wxr_path: Path) -> str:
+    """Auto-detect the WordPress namespace URI from a WXR file.
+
+    Scans the file for known WXR namespace declarations and returns
+    the first match.  Falls back to the latest version (1.2) if none
+    is found.
+    """
+    try:
+        with open(wxr_path, "r", encoding="utf-8") as fh:
+            # Only need to inspect the first few KB for the <rss> element
+            head = fh.read(4096)
+    except (OSError, UnicodeDecodeError):
+        return _WP_NS_VERSIONS[0]
+
+    for ns in _WP_NS_VERSIONS:
+        if ns in head:
+            return ns
+
+    return _WP_NS_VERSIONS[0]
+
+
+def _sanitize_xml_stream(wxr_path: Path) -> io.StringIO:
+    """Read a WXR file and fix bare ampersands, returning a StringIO stream.
+
+    WordPress exports often contain bare ``&`` that are not valid XML
+    entities.  This helper reads the file, applies the fix, and returns
+    a seekable stream suitable for ``ET.iterparse``.
+    """
+    try:
+        raw_xml = wxr_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ExportError(f"Cannot read {wxr_path}: {e}") from e
+
+    raw_xml = re.sub(
+        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
+        "&amp;",
+        raw_xml,
+    )
+    return io.StringIO(raw_xml)
+
+
 class WordpressWxrExporter:
     """Converts WordPress WXR XML exports to Markdown files.
 
@@ -217,7 +290,8 @@ class WordpressWxrExporter:
     wxr_path : Path
         Path to the WXR XML export file.
     out_dir : Path
-        Output directory for Markdown files.
+        Output directory for Markdown files.  **Required** — callers
+        should always provide an explicit directory.
     post_types : set
         Set of wp:post_type values to export.
     statuses : set
@@ -241,7 +315,11 @@ class WordpressWxrExporter:
         max_posts=None,
     ):
         self.wxr_path = Path(wxr_path)
-        self.out_dir = Path(out_dir) if out_dir is not None else DEFAULT_OUT_DIR
+        if out_dir is None:
+            raise ValueError(
+                "out_dir is required. Pass an explicit output directory."
+            )
+        self.out_dir = Path(out_dir)
         self.post_types = post_types if post_types is not None else {"post"}
         self.statuses = statuses if statuses is not None else {"publish"}
         self.overwrite = overwrite
@@ -252,129 +330,136 @@ class WordpressWxrExporter:
         """Execute the export and return an ExportReport."""
         exported = 0
         skipped = 0
-        errors = []
-        used_filenames = set()
+        errors: list[str] = []
+        used_filenames: set[str] = set()
 
         # Create output directory
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Read and sanitize XML content (fix unescaped ampersands)
-        try:
-            raw_xml = self.wxr_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            raise Exception(f"Cannot read {self.wxr_path}: {e}") from e
+        # Auto-detect WXR namespace version
+        wp_ns = _detect_wp_namespace(self.wxr_path)
 
-        # Fix bare & that aren't part of XML entities
-        raw_xml = re.sub(
-            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
-            "&amp;",
-            raw_xml,
-        )
-
-        # Parse sanitized XML
+        # Read, sanitize, and parse XML with streaming iterparse
+        xml_stream = _sanitize_xml_stream(self.wxr_path)
         try:
-            root = ET.fromstring(raw_xml)
+            context = ET.iterparse(xml_stream, events=("end",))
         except ET.ParseError as e:
-            raise Exception(f"XML parse error: {e}") from e
+            raise ExportError(f"XML parse error: {e}") from e
 
-        # Find all <item> elements (they may be under <channel>)
-        for elem in root.iter("item"):
-            # Check max_posts cap
-            if self.max_posts is not None and exported >= self.max_posts:
-                elem.clear()
-                continue
+        try:
+            for event, elem in context:
+                if elem.tag != "item":
+                    continue
 
-            # Extract post type and status for filtering
-            post_type = _get_text(elem, f"{{{WP_NS}}}post_type")
-            status = _get_text(elem, f"{{{WP_NS}}}status")
-
-            if post_type not in self.post_types:
-                elem.clear()
-                continue
-
-            if status not in self.statuses:
-                elem.clear()
-                continue
-
-            # Extract fields
-            title = _get_text(elem, "title", "Untitled")
-            post_id = _get_text(elem, f"{{{WP_NS}}}post_id", "0")
-            link = _get_text(elem, "link", "")
-            date = _resolve_date(elem)
-            slug = _resolve_slug(elem)
-            tags = _extract_tags(elem)
-            categories = _extract_categories(elem)
-
-            # Get content
-            content_el = elem.find(f"{{{CONTENT_NS}}}encoded")
-            if content_el is None or content_el.text is None:
-                logger.warning(
-                    "Post '%s' (id=%s) missing content:encoded",
-                    title,
-                    post_id,
-                )
-                html_content = ""
-            else:
-                html_content = content_el.text
-
-            # Convert HTML to Markdown
-            md_body = _html_to_markdown(html_content)
-
-            # Build front matter
-            front_matter = _build_front_matter(
-                title=title,
-                date=date,
-                url=link,
-                post_id=post_id,
-                post_type=post_type,
-                status=status,
-                slug=slug,
-                tags=tags,
-                categories=categories,
-            )
-
-            # Build full file content
-            file_content = front_matter + "\n" + md_body + "\n"
-
-            # Determine output filename
-            date_prefix = date.strftime("%Y-%m-%d") if date else "0000-00-00"
-            base_filename = f"{date_prefix}-{slug}.md"
-
-            if base_filename in used_filenames:
-                base_filename = f"{date_prefix}-{slug}-{post_id}.md"
-
-            used_filenames.add(base_filename)
-            out_path = self.out_dir / base_filename
-
-            # Incremental check: skip if file exists and content hash matches
-            if (
-                self.incremental
-                and not self.overwrite
-                and out_path.exists()
-            ):
-                existing_hash = hashlib.md5(
-                    out_path.read_bytes()
-                ).hexdigest()
-                new_hash = hashlib.md5(
-                    file_content.encode("utf-8")
-                ).hexdigest()
-                if existing_hash == new_hash:
-                    skipped += 1
+                # Check max_posts cap
+                if self.max_posts is not None and exported >= self.max_posts:
                     elem.clear()
                     continue
 
-            # Write file
-            try:
-                out_path.write_text(
-                    file_content, encoding="utf-8", newline="\n"
-                )
-                exported += 1
-            except OSError as e:
-                raise Exception(
-                    f"Cannot write to {out_path}: {e}"
-                ) from e
+                # Extract post type and status for filtering
+                post_type = _get_text(elem, f"{{{wp_ns}}}post_type")
+                status = _get_text(elem, f"{{{wp_ns}}}status")
 
-            # Clear element to free memory
-            elem.clear()
+                if post_type not in self.post_types:
+                    elem.clear()
+                    continue
+
+                if status not in self.statuses:
+                    elem.clear()
+                    continue
+
+                # Extract fields
+                title = _get_text(elem, "title", "Untitled")
+                post_id = _get_text(elem, f"{{{wp_ns}}}post_id", "0")
+                link = _get_text(elem, "link", "")
+                date = _resolve_date(elem, wp_ns)
+                slug = _resolve_slug(elem, wp_ns)
+                tags = _extract_tags(elem)
+                categories = _extract_categories(elem)
+
+                # Get content
+                content_el = elem.find(f"{{{CONTENT_NS}}}encoded")
+                if content_el is None or content_el.text is None:
+                    logger.warning(
+                        "Post '%s' (id=%s) missing content:encoded",
+                        title,
+                        post_id,
+                    )
+                    html_content = ""
+                else:
+                    html_content = content_el.text
+
+                # Convert HTML to Markdown
+                md_body = _html_to_markdown(html_content)
+
+                # Build front matter
+                front_matter = _build_front_matter(
+                    title=title,
+                    date=date,
+                    url=link,
+                    post_id=post_id,
+                    post_type=post_type,
+                    status=status,
+                    slug=slug,
+                    tags=tags,
+                    categories=categories,
+                )
+
+                # Build full file content
+                file_content = front_matter + "\n" + md_body + "\n"
+
+                # Determine output filename with robust collision handling
+                date_prefix = date.strftime("%Y-%m-%d") if date else "0000-00-00"
+                base_filename = f"{date_prefix}-{slug}.md"
+
+                if base_filename in used_filenames:
+                    # Try with post_id suffix first, then increment
+                    candidate = f"{date_prefix}-{slug}-{post_id}.md"
+                    counter = 2
+                    while candidate in used_filenames:
+                        candidate = f"{date_prefix}-{slug}-{post_id}-{counter}.md"
+                        counter += 1
+                    base_filename = candidate
+
+                used_filenames.add(base_filename)
+                out_path = self.out_dir / base_filename
+
+                # Incremental check: skip if file exists and content hash matches
+                try:
+                    file_exists = out_path.exists()
+                except OSError:
+                    file_exists = False
+
+                if (
+                    self.incremental
+                    and not self.overwrite
+                    and file_exists
+                ):
+                    existing_hash = hashlib.md5(
+                        out_path.read_bytes()
+                    ).hexdigest()
+                    new_hash = hashlib.md5(
+                        file_content.encode("utf-8")
+                    ).hexdigest()
+                    if existing_hash == new_hash:
+                        skipped += 1
+                        elem.clear()
+                        continue
+
+                # Write file — collect errors to allow partial exports
+                try:
+                    out_path.write_text(
+                        file_content, encoding="utf-8", newline="\n"
+                    )
+                    exported += 1
+                except OSError as e:
+                    error_msg = f"Cannot write to {out_path}: {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+
+                # Clear element to free memory
+                elem.clear()
+        except ET.ParseError as e:
+            raise ExportError(f"XML parse error: {e}") from e
 
         return ExportReport(exported=exported, skipped=skipped, errors=errors)

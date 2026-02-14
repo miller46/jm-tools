@@ -7,7 +7,7 @@ Usage:
 import argparse
 from pathlib import Path
 
-from .exporter import WordpressWxrExporter
+from .exporter import WordpressWxrExporter, _CLI_DEFAULT_OUT_DIR
 
 
 def main():
@@ -60,11 +60,13 @@ def main():
     post_types = set(args.include.split(",")) if args.include else None
     statuses = set(args.status.split(",")) if args.status else None
 
+    # CLI provides a default out_dir; the library API requires it explicitly
+    out_dir = args.out_dir if args.out_dir is not None else _CLI_DEFAULT_OUT_DIR
+
     kwargs = {
         "wxr_path": args.wxr,
+        "out_dir": out_dir,
     }
-    if args.out_dir is not None:
-        kwargs["out_dir"] = args.out_dir
     if post_types is not None:
         kwargs["post_types"] = post_types
     if statuses is not None:
