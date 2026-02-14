@@ -1,0 +1,13 @@
+openai
+tiktoken
+asyncio
+requests
+discord.py
+tweepy
+feedparser
+python-telegram-bot==11.1.0
+marshmallow_dataclass>=8.5.8
+beautifulsoup4>=4.11.1
+selenium>=4.8.2
+webdriver-manager==3.8.5
+websocket-client
