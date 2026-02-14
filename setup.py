@@ -18,6 +18,8 @@ REQUIRED = [
     "selenium>=4.8.2",
     "webdriver-manager==3.8.5",
     "websocket-client",
+    "markdownify",
+    "pyyaml",
 ]
 
 setup(

@@ -1,0 +1,166 @@
+## Summary
+
+Add a `wordpress_wxr` module to `jm_tools/` that converts a WordPress WXR XML export into individual Markdown files in `data/writing/wordpress/`.
+
+Usable as both a **standalone CLI** and a **callable class**. Zero WordPress runtime dependency.
+
+---
+
+## Module layout
+
+```
+jm_tools/
+  wordpress_wxr/
+    __init__.py      # re-export WordpressWxrExporter
+    exporter.py      # core logic
+    __main__.py      # CLI entry point
+```
+
+---
+
+## Sub-task 1 — `WordpressWxrExporter` class
+
+### Constructor parameters
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `wxr_path` | `Path` | **required** | Path to WXR XML file |
+| `out_dir` | `Path` | `data/writing/wordpress` | Output directory |
+| `post_types` | `set[str]` | `{"post"}` | Filter: export only these `wp:post_type` values |
+| `statuses` | `set[str]` | `{"publish"}` | Filter: export only these `wp:status` values |
+| `overwrite` | `bool` | `False` | Overwrite existing files even when content unchanged |
+| `incremental` | `bool` | `True` | Hash file payload; skip write if identical |
+| `max_posts` | `int \| None` | `None` | Cap number of exported posts |
+
+### `run() → ExportReport`
+
+Return a dataclass/Pydantic model:
+
+```python
+@dataclass
+class ExportReport:
+    exported: int
+    skipped: int
+    errors: list[str]
+```
+
+### Export filter
+
+Export a `<item>` iff:
+- `wp:post_type ∈ post_types`
+- `wp:status ∈ statuses`
+
+### Date resolution (first non-empty wins)
+
+1. `wp:post_date_gmt`
+2. `pubDate`
+3. `wp:post_date`
+
+Warn on unparseable date; fall back to next candidate.
+
+### Slug resolution (first non-empty wins)
+
+1. `wp:post_name`
+2. Slugified title (lowercase, hyphens, strip non-alphanumeric)
+
+### Output file path
+
+`out_dir/YYYY-MM-DD-slug.md`
+
+On filename collision append `-<post_id>`:
+`out_dir/YYYY-MM-DD-slug-12345.md`
+
+### Markdown file format
+
+UTF-8, `\n` newlines.
+
+**Front matter** (stable key order):
+
+```yaml
+---
+title: "<title>"
+date: "<ISO 8601>"
+url: "<permalink>"
+source: "wordpress"
+wp:
+  id: "<post_id>"
+  post_type: "<post_type>"
+  status: "<status>"
+  slug: "<slug>"
+tags: ["tag1", "tag2"]
+categories: ["cat1", "cat2"]
+---
+```
+
+**Body**: HTML from `content:encoded` converted to Markdown.
+- Preserve: headings, lists, links, blockquotes, fenced code blocks.
+- Strip: inline `style`/`class` attributes, WordPress editor comments/artifacts.
+
+### Implementation constraints
+
+- Stream-parse XML with `iterparse` (do not load full DOM).
+- Use namespace-aware extraction for `content:`, `wp:`, `dc:` prefixes.
+- Deterministic HTML→Markdown conversion (use `markdownify` or equivalent).
+- No side effects outside `out_dir`.
+
+### Errors
+
+| Severity | Condition |
+|---|---|
+| Fatal (raise) | XML parse failure |
+| Fatal (raise) | `out_dir` not writable |
+| Warning (log) | Missing `content:encoded` for a post |
+| Warning (log) | Unparseable date (fallback applied) |
+
+---
+
+## Sub-task 2 — CLI (`__main__.py`)
+
+```bash
+python -m jm_tools.wordpress_wxr --wxr path/to/export.xml
+```
+
+| Flag | Maps to |
+|---|---|
+| `--wxr` | `wxr_path` (required) |
+| `--out-dir` | `out_dir` |
+| `--include post,page` | `post_types` |
+| `--status publish,draft` | `statuses` |
+| `--no-incremental` | `incremental=False` |
+| `--overwrite` | `overwrite=True` |
+| `--max-posts N` | `max_posts` |
+
+Use `argparse`. Print `ExportReport` summary on completion.
+
+---
+
+## Sub-task 3 — Unit tests
+
+Place in `tests/wordpress_wxr/`.
+
+Cover at minimum:
+
+1. **Filename collision handling** — two posts with same date+slug produce distinct filenames.
+2. **Date resolution** — verify fallback order (`post_date_gmt` → `pubDate` → `post_date`).
+3. **Slug resolution** — verify `wp:post_name` preferred over slugified title.
+4. **Front matter emission** — output contains expected YAML keys in stable order.
+5. **Incremental skip** — unchanged content produces no write on second run.
+
+Use small inline WXR XML fixtures (no external files needed).
+
+---
+
+## Dependencies
+
+Add to `setup.py` `REQUIRED`:
+- `markdownify` (HTML→Markdown)
+- `pyyaml` (front matter serialization)
+
+---
+
+## Acceptance criteria
+
+- [ ] `python -m jm_tools.wordpress_wxr --wxr sample.xml` produces correct Markdown files
+- [ ] `WordpressWxrExporter` importable from `jm_tools.wordpress_wxr`
+- [ ] All unit tests pass
+- [ ] No runtime WordPress dependency
